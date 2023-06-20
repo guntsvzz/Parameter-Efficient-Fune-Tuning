@@ -104,31 +104,6 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 print('Original parameters :', count_parameters(model))
 
-###5. Training
-from torch.optim import AdamW
-##optimizer
-optimizer = AdamW(model.parameters(), lr=5e-5)
-from transformers import get_scheduler
-num_epochs = 5
-num_training_steps = num_epochs * len(train_dataloader)
-lr_scheduler = get_scheduler(
-    name="linear", 
-    optimizer=optimizer, 
-    num_warmup_steps=0, 
-    num_training_steps=num_training_steps
-)
-
-##Accelerate
-from accelerate import Accelerator
-accelerator = Accelerator()
-model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
-    model, optimizer, train_dataloader, eval_dataloader
-)
-### Cuda Checking
-import torch
-device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-model = model.to(device)
-
 from peft import (
     get_peft_config,
     get_peft_model,
@@ -140,10 +115,13 @@ from peft import (
     PromptEncoderConfig,
     LoraConfig,
 )
-PEFTtechnique = 'FT'
+
+PEFTtechnique = 'Prefix'
+print(f'Technique : {PEFTtechnique}')
 if PEFTtechnique == 'FT':
     pass
 elif PEFTtechnique == 'Adapter':
+    #!pip install -U adapter-transformers
     from transformers.adapters import BertAdapterModel, AutoAdapterModel 
     model = BertAdapterModel.from_pretrained("bert-base-cased", num_labels=num_labels) 
     # Add a new adapter
@@ -156,6 +134,27 @@ elif PEFTtechnique == 'Adapter':
       )
     # Activate the adapter
     model.train_adapter(task_name)
+    
+    def print_trainable_parameters(model):
+        """
+        Prints the number of trainable parameters in the model.
+        """
+        trainable_params = 0
+        all_param = 0
+        for _, param in model.named_parameters():
+            num_params = param.numel()
+            # if using DS Zero 3 and the weights are initialized empty
+            if num_params == 0 and hasattr(param, "ds_numel"):
+                num_params = param.ds_numel
+
+            all_param += num_params
+            if param.requires_grad:
+                trainable_params += num_params
+        print(
+            f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}"
+        )
+        
+    print_trainable_parameters(model) 
 elif PEFTtechnique == 'Prefix':
     peft_config = PrefixTuningConfig(task_type="SEQ_CLS", num_virtual_tokens=20, encoder_hidden_size=128)
     model = get_peft_model(model, peft_config)
@@ -177,25 +176,49 @@ elif PEFTtechnique == 'BitFit':
         if 'bias' not in name:
             param.requires_grad = False 
 
+###5. Training
+from torch.optim import AdamW
+##optimizer
+optimizer = AdamW(model.parameters(), lr=5e-5)
+from transformers import get_scheduler
+num_epochs = 5
+num_training_steps = num_epochs * len(train_dataloader)
+lr_scheduler = get_scheduler(
+    name="linear", 
+    optimizer=optimizer, 
+    num_warmup_steps=0, 
+    num_training_steps=num_training_steps
+)
+            
+from accelerate import Accelerator
+accelerator = Accelerator()
+model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
+    model, optimizer, train_dataloader, eval_dataloader
+)
+### Cuda Checking
+import torch
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+model = model.to(device)
+
 ###Metric
 import numpy as np
 import evaluate
 metric = evaluate.load("accuracy")
+print(metric)
 # metric = load_metric("glue", task_name)
 
+print('Training')
 ####5. Training
 import torch
 from tqdm.auto import tqdm
-gradient_accumulation_steps = 1
 progress_bar = tqdm(range(num_training_steps))
 model.train()
 eval_metrics = 0
 for epoch in range(num_epochs):
     for batch in train_dataloader:
-        # batch = {k: v.to(device) for k, v in batch.items()}
+        batch = {k: v.to(device) for k, v in batch.items()}
         outputs = model(**batch)
         loss = outputs.loss
-        loss = loss/gradient_accumulation_steps
         # loss.backward()
         accelerator.backward(loss)
         # Step with optimizer
@@ -206,7 +229,7 @@ for epoch in range(num_epochs):
         
     model.eval()
     for batch in eval_dataloader:
-        # batch = {k: v.to(device) for k, v in batch.items()}
+        batch = {k: v.to(device) for k, v in batch.items()}
         with torch.no_grad():
             outputs = model(**batch)
     
@@ -217,6 +240,6 @@ for epoch in range(num_epochs):
             references=batch["labels"])
         
     eval_metric = metric.compute()
-    eval_metrics += eval_metric.values()
-    print(f"Epoch at {epoch}: {eval_metric}")
-print('Avg Metric', eval_metrics/len(eval_metrics))
+    eval_metrics += eval_metric['accuracy'] 
+    print(f"Epoch at {epoch+1}: {eval_metric}")
+print('Avg Metric', eval_metrics/num_epochs)
